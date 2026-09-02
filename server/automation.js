@@ -2,13 +2,36 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { selectors, config } from './config.js';
+
+// Anchor the session dir to THIS file, not process.cwd(). Started from the repo
+// root (`node server/server.js` rather than `cd server && npm start`) a
+// cwd-relative path put the Chrome profile in the project root, where
+// .gitignore does not cover it — so the login cookies were one `git add -A`
+// away from being committed — and where Vite's file watcher hit the locked
+// profile files and crashed the dev server.
+const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Shared browser state ────────────────────────────────────────────────────
 // We use a PERSISTENT browser profile (a real on-disk Chrome user-data dir).
 // This keeps the Cloudflare "clearance" cookie and the Circle login between
 // runs, so the human-check stops reappearing after you pass it once.
 let context = null;
+// The CDP handle when we ATTACHED to a Chrome someone else started. Kept apart
+// from `context` because it decides who may close the browser: a browser we
+// attached to is not ours to close.
+let browser = null;
+// How the cached context was obtained — 'attached' | 'headed' | 'headless'. A
+// live browser cannot be switched between these, so this is what tells us to
+// tear down and start over.
+let contextMode = null;
+// Every step — the login, the member scrape, and each DM — drives this ONE tab.
+// A campaign used to open and close a tab per member, which flickers the window
+// and steals focus on every iteration; reusing one tab keeps the whole run in
+// place where you can actually watch it. Reset whenever the context goes away.
+let sharedPage = null;
 
 // A run is cancellable via this flag, flipped by stop().
 let stopRequested = false;
@@ -34,21 +57,45 @@ export function setDelay(seconds) {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 // Try a list of candidate selectors and return the first visible one, or null.
+//
+// All candidates are waited on CONCURRENTLY, then awaited in list order. That
+// keeps the documented "first match in the list wins" priority while costing
+// `timeout` in total instead of `candidates.length * timeout`. It matters most
+// in the miss case: loggedInMarker has 8 candidates, so the sequential version
+// burned 24s per isLoggedIn() call — inside a 2s polling loop.
 async function findFirst(scope, candidates, { timeout = 1500 } = {}) {
-  for (const sel of candidates) {
+  const attempts = candidates.map((sel) => {
     const loc = scope.locator(sel).first();
-    try {
-      await loc.waitFor({ state: 'visible', timeout });
-      return loc;
-    } catch {
-      // try next candidate
-    }
+    return loc.waitFor({ state: 'visible', timeout }).then(
+      () => loc,
+      () => null
+    );
+  });
+  for (const attempt of attempts) {
+    const loc = await attempt;
+    if (loc) return loc;
   }
   return null;
 }
 
+// Playwright errors carry a multi-line "Call log:" trailer with ANSI colour
+// codes in it. Piped into the UI's log panel that renders as several lines of
+// `+[2m` noise around the one sentence that matters, so keep just that.
+function briefError(err) {
+  return String(err?.message ?? err)
+    .split(/\r?\nCall log:/)[0]
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .trim();
+}
+
 function normalizeBase(url) {
-  return url.trim().replace(/\/+$/, '');
+  const trimmed = url.trim().replace(/\/+$/, '');
+  // The UI accepts a bare hostname ("community.iaug.org" — no scheme). Playwright
+  // rejects that outright ("Cannot navigate to invalid URL") and `new URL()` on it
+  // throws, which silently left the host empty in the login wait loop below. So
+  // settle the scheme once, here, where every caller goes through.
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 // Canonical form of a profile URL for history comparison (drop query/hash/slash).
@@ -58,15 +105,24 @@ function normalizeProfileUrl(url) {
 
 // ─── "Already-sent" history (persisted per community+account) ────────────────
 
+// Resolve a path inside the session dir, creating the dir on first use only.
+let sessionDirReady = false;
+function sessionPath(...parts) {
+  const dir = path.resolve(SERVER_DIR, config.sessionDir);
+  if (!sessionDirReady) {
+    fs.mkdirSync(dir, { recursive: true });
+    sessionDirReady = true;
+  }
+  return path.join(dir, ...parts);
+}
+
 function historyFileFor(communityUrl, email) {
   const key = crypto
     .createHash('sha256')
     .update(`${communityUrl}::${email}`)
     .digest('hex')
     .slice(0, 16);
-  const dir = path.resolve(process.cwd(), config.sessionDir);
-  fs.mkdirSync(dir, { recursive: true });
-  return path.join(dir, `sent-${key}.json`);
+  return sessionPath(`sent-${key}.json`);
 }
 
 function loadHistory(file) {
@@ -90,9 +146,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ─── Campaign history (per community), persisted across runs ─────────────────
 
 function campaignsFile() {
-  const dir = path.resolve(process.cwd(), config.sessionDir);
-  fs.mkdirSync(dir, { recursive: true });
-  return path.join(dir, 'campaigns.json');
+  return sessionPath('campaigns.json');
 }
 
 function loadCampaigns() {
@@ -116,18 +170,26 @@ function recordCampaign(rec) {
 // Aggregate raw runs by community for the dashboard.
 export function getCampaignHistory() {
   const byCommunity = new Map();
+  const aggFor = (url) => {
+    let agg = byCommunity.get(url);
+    if (!agg) {
+      agg = {
+        communityUrl: url,
+        runs: 0,
+        totalMembers: 0,
+        processed: 0,
+        sent: 0,
+        skipped: 0,
+        failed: 0,
+        lastRun: null,
+      };
+      byCommunity.set(url, agg);
+    }
+    return agg;
+  };
+
   for (const r of loadCampaigns()) {
-    const key = r.communityUrl;
-    const agg = byCommunity.get(key) || {
-      communityUrl: key,
-      runs: 0,
-      totalMembers: 0,
-      processed: 0,
-      sent: 0,
-      skipped: 0,
-      failed: 0,
-      lastRun: null,
-    };
+    const agg = aggFor(r.communityUrl);
     agg.runs += 1;
     agg.totalMembers += r.total || 0;
     agg.processed += (r.sent || 0) + (r.skipped || 0) + (r.failed || 0);
@@ -135,27 +197,15 @@ export function getCampaignHistory() {
     agg.skipped += r.skipped || 0;
     agg.failed += r.failed || 0;
     if (!agg.lastRun || r.finishedAt > agg.lastRun) agg.lastRun = r.finishedAt;
-    byCommunity.set(key, agg);
   }
   // Merge in communities that have been SCRAPED (member lists saved), even if
   // no send campaign has run for them yet.
-  const store = loadMembersStore();
-  for (const [url, data] of Object.entries(store)) {
-    const agg = byCommunity.get(url) || {
-      communityUrl: url,
-      runs: 0,
-      totalMembers: 0,
-      processed: 0,
-      sent: 0,
-      skipped: 0,
-      failed: 0,
-      lastRun: null,
-    };
+  for (const [url, data] of Object.entries(loadMembersStore())) {
+    const agg = aggFor(url);
     agg.scrapedMembers = (data.urls || []).length;
     if (data.scrapedAt && (!agg.lastRun || data.scrapedAt > agg.lastRun)) {
       agg.lastRun = data.scrapedAt;
     }
-    byCommunity.set(url, agg);
   }
 
   return [...byCommunity.values()]
@@ -170,9 +220,7 @@ export function getCampaignHistory() {
 // ─── Saved member lists (per community), persisted across runs ───────────────
 
 function membersFile() {
-  const dir = path.resolve(process.cwd(), config.sessionDir);
-  fs.mkdirSync(dir, { recursive: true });
-  return path.join(dir, 'members.json');
+  return sessionPath('members.json');
 }
 
 function loadMembersStore() {
@@ -204,17 +252,112 @@ export function getMembersFor(communityUrl) {
 
 // ─── Browser lifecycle ───────────────────────────────────────────────────────
 
-async function ensureContext({ headed, log }) {
-  if (context) return context;
+const cdpEndpoint = () => `http://127.0.0.1:${config.debugPort}`;
 
-  const profileDir = path.resolve(process.cwd(), config.sessionDir, 'profile');
+// Ask Chrome's debug endpoint who it is. Doubles as the "is it up yet?" probe,
+// so a closed port is an expected answer (null), not an error.
+async function probeCdp(timeoutMs = 1200) {
+  try {
+    const res = await fetch(`${cdpEndpoint()}/json/version`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+function findChromeExe() {
+  if (config.chromePath) return config.chromePath;
+  const candidates = [
+    process.env.PROGRAMFILES,
+    process.env['PROGRAMFILES(X86)'],
+    process.env.LOCALAPPDATA,
+  ]
+    .filter(Boolean)
+    .map((root) => path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+  candidates.push(
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable'
+  );
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
+// Open Chrome with its debug port listening, DETACHED so the window outlives
+// this backend — a browser that dies with the server is exactly what attaching
+// gets us away from. Returns once the port answers.
+async function startDebugChrome(log) {
+  const exe = findChromeExe();
+  if (!exe) {
+    throw new Error('Could not find Chrome — install it, or set chromePath in server/config.js.');
+  }
+  const dir = config.chromeUserDataDir || sessionPath('profile');
+  fs.mkdirSync(dir, { recursive: true });
+  log(`Opening Chrome with remote debugging on port ${config.debugPort}...`, 'info');
+  spawn(
+    exe,
+    [
+      `--remote-debugging-port=${config.debugPort}`,
+      // Not optional: since Chrome 136 the browser REFUSES to expose the debug
+      // port for its default user-data-dir, so pointing somewhere else is what
+      // makes the port open at all.
+      `--user-data-dir=${dir}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-blink-features=AutomationControlled',
+    ],
+    { detached: true, stdio: 'ignore' }
+  ).unref();
+
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    const info = await probeCdp();
+    if (info) return info;
+  }
+  throw new Error(
+    `Chrome opened but port ${config.debugPort} never answered. If Chrome was already ` +
+      'running on that same profile it just added a tab to the existing window instead ' +
+      'of starting a debuggable one — quit Chrome completely, then try again.'
+  );
+}
+
+// Attach to a Chrome that is ALREADY OPEN, starting one only when nothing is
+// listening. We reuse that browser's DEFAULT context, so the run happens in a
+// new tab of the window already on screen, carrying whatever logins it has —
+// and the window stays put when this backend stops.
+async function attachContext(log) {
+  let info = await probeCdp();
+  if (info) log(`Attaching to the Chrome already open (${info.Browser}).`, 'success');
+  else info = await startDebugChrome(log);
+
+  browser = await chromium.connectOverCDP(cdpEndpoint());
+  // Playwright does not OWN this browser. If the person closes Chrome, or the
+  // socket drops, clear the cached handles so the next run reconnects instead
+  // of driving a dead one.
+  browser.on('disconnected', () => {
+    browser = null;
+    context = null;
+    contextMode = null;
+    sharedPage = null;
+  });
+  return browser.contexts()[0] || (await browser.newContext());
+}
+
+// The fallback: a browser Playwright launches and owns, from a persistent
+// on-disk profile. Still the only option for headless runs, which by definition
+// have no visible window to attach to.
+async function launchContext(wantHeaded, log) {
+  const profileDir = sessionPath('profile');
   fs.mkdirSync(profileDir, { recursive: true });
   const hadProfile = fs.existsSync(path.join(profileDir, 'Default'));
 
-  log(`Launching browser (${headed ? 'visible' : 'headless'})...`, 'info');
+  log(`Launching browser (${wantHeaded ? 'visible' : 'headless'})...`, 'info');
+  let ctx;
   try {
-    context = await chromium.launchPersistentContext(profileDir, {
-      headless: !headed,
+    ctx = await chromium.launchPersistentContext(profileDir, {
+      headless: !wantHeaded,
       // A real Chrome profile + the real Chrome channel is the most reliable way
       // past Cloudflare's "Verifying you are a human" managed challenge.
       channel: config.browserChannel || undefined,
@@ -226,8 +369,7 @@ async function ensureContext({ headed, log }) {
       ],
     });
   } catch (err) {
-    context = null;
-    if (headed && /display|x11|cannot open/i.test(err.message)) {
+    if (wantHeaded && /display|x11|cannot open/i.test(err.message)) {
       throw new Error(
         'Cannot open a visible browser — no graphical display found. Run the backend ' +
           'from your desktop (a terminal inside your logged-in session), not over SSH/headless. ' +
@@ -237,29 +379,83 @@ async function ensureContext({ headed, log }) {
     throw err;
   }
 
-  // If the window/context is closed (user closes it, or Chrome crashes), drop
-  // the stale singleton so the next attempt relaunches cleanly.
-  context.once('close', () => {
+  // If the window is closed (by hand, or Chrome crashes), drop the stale
+  // singleton so the next attempt relaunches cleanly.
+  ctx.once('close', () => {
     context = null;
+    contextMode = null;
+    sharedPage = null;
   });
+  if (hadProfile) log('Reusing saved browser profile (login + Cloudflare clearance).', 'info');
+  return ctx;
+}
 
+async function ensureContext({ headed, log }) {
+  const wantHeaded = !!headed;
+  // Attaching means driving a visible window, so it can only serve a headed run.
+  const mode =
+    config.attachToChrome && wantHeaded ? 'attached' : wantHeaded ? 'headed' : 'headless';
+
+  // A live browser can't be flipped between these, and the context is cached for
+  // the life of the process. So a headless scrape left a headless browser cached
+  // and the next login with "Show browser window" ON silently reused it — no
+  // window ever opened, and a login you cannot see is a login you cannot finish.
+  if (context && contextMode !== mode) {
+    log(`Switching browser to ${mode} mode...`, 'info');
+    await shutdown();
+  }
+  if (context) return context;
+
+  context = mode === 'attached' ? await attachContext(log) : await launchContext(wantHeaded, log);
+  contextMode = mode;
   context.setDefaultTimeout(config.actionTimeoutMs);
   // Hide the navigator.webdriver flag that automated Chromium exposes.
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
-
-  if (hadProfile) log('Reusing saved browser profile (login + Cloudflare clearance).', 'info');
   return context;
+}
+
+// The single tab every step runs in: the login, the member scrape, and each DM
+// all drive this one page instead of opening their own.
+async function getPage(ctx = context) {
+  if (sharedPage && !sharedPage.isClosed()) return sharedPage;
+  // When attached, every other tab is one the person is actually using — never
+  // take one of those over, always add our own. A browser we launched ourselves
+  // opens with one blank tab, so adopt that rather than stranding it beside the
+  // tab we work in.
+  const blank =
+    contextMode === 'attached'
+      ? null
+      : ctx.pages().find((p) => !p.isClosed() && p.url() === 'about:blank');
+  sharedPage = blank || (await ctx.newPage());
+  await sharedPage.bringToFront().catch(() => {});
+  // Nothing closes the tab between steps any more, and page.close() skipped
+  // beforeunload handlers while a navigation does not — so a composer left
+  // holding text can now raise "Leave site?" and block the next member forever.
+  // Accept those; keep Playwright's default (dismiss) for anything else.
+  sharedPage.on('dialog', (d) => {
+    (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {});
+  });
+  return sharedPage;
 }
 
 export async function shutdown() {
   try {
-    await context?.close();
+    // Close only a browser we LAUNCHED. An attached one belongs to the person at
+    // the keyboard, and browser.close() over CDP is documented as closing the
+    // connection but observably takes Chrome down with it — so on the attached
+    // path we close nothing but our own tab and simply drop the handles. Ctrl+C
+    // on the backend must not take their window and tabs with it.
+    if (contextMode === 'attached') await sharedPage?.close().catch(() => {});
+    else await context?.close();
   } catch {
     /* ignore */
   }
+  browser = null;
   context = null;
+  contextMode = null;
+  sharedPage = null;
 }
 
 // ─── Login ───────────────────────────────────────────────────────────────────
@@ -282,17 +478,42 @@ async function isLoggedIn(page) {
   return marker !== null;
 }
 
-async function login({ communityUrl, email, password, headed, log, loginMethod }) {
+// Sign-in does NOT always finish in the tab we opened: Google's OAuth popup
+// commonly lands back on the community and closes itself, and a fully-manual
+// sign-in can happen in any tab of the window. Polling only our own tab meant a
+// login that plainly succeeded on screen still timed out with "Login was not
+// completed in time". So scan every open page, skipping the ones not on the
+// community host (a blank tab, or Google's domain) — that pre-filter keeps the
+// scan to the one or two tabs worth a 3s marker probe.
+async function findLoggedInPage(ctx, host) {
+  for (const p of ctx.pages()) {
+    if (p.isClosed()) continue;
+    let url = '';
+    try {
+      url = p.url();
+    } catch {
+      continue;
+    }
+    if (host && !url.includes(host)) continue;
+    if (await isLoggedIn(p).catch(() => false)) return p;
+  }
+  return null;
+}
+
+async function login({ communityUrl, email, password, headed, log }) {
   const base = normalizeBase(communityUrl);
   const ctx = await ensureContext({ headed, log });
-  const page = await ctx.newPage();
+  const page = await getPage(ctx);
 
   // If the saved session is still valid, skip the login form entirely.
-  await page.goto(base, { waitUntil: 'domcontentloaded' });
+  try {
+    await page.goto(base, { waitUntil: 'domcontentloaded' });
+  } catch (err) {
+    throw new Error(`Could not open ${base} — check the community URL. (${briefError(err)})`);
+  }
   await page.waitForTimeout(3500); // let the SPA render before checking markers
   if (await isLoggedIn(page)) {
     log('Already logged in.', 'success');
-    await page.close();
     return true;
   }
 
@@ -310,14 +531,8 @@ async function login({ communityUrl, email, password, headed, log, loginMethod }
   //  3. Otherwise just let you log in by hand in the visible window.
   let autoFilled = false;
   let googleUsed = false;
-  const wantGoogle = loginMethod !== 'password';
   try {
-    const googleBtn = wantGoogle
-      ? await findFirst(page, selectors.login.googleButton, { timeout: 3000 })
-      : null;
-    if (loginMethod === 'google' && !googleBtn) {
-      log('No "Sign in with Google" button found — log in manually in the window.', 'warn');
-    }
+    const googleBtn = await findFirst(page, selectors.login.googleButton, { timeout: 3000 });
     if (googleBtn) {
       log('Starting Google sign-in...', 'info');
       let popup = null;
@@ -397,16 +612,21 @@ async function login({ communityUrl, email, password, headed, log, loginMethod }
   const deadline = Date.now() + waitMs;
   let ok = false;
   let lastReload = 0;
+  let lastNudge = Date.now();
   let announcedCf = false;
   // The loop is cancellable: pressing Cancel sets stopRequested, freeing the
   // backend immediately instead of hanging for the whole window.
+  //
+  // It also never touches `page` for its own timing — closing that tab (easy to
+  // do by hand mid-login) used to abort the whole attempt with "Target closed".
   while (Date.now() < deadline && !stopRequested) {
-    if (await isLoggedIn(page)) {
+    if (await findLoggedInPage(ctx, host)) {
       ok = true;
       break;
     }
-    const onCommunity = page.url().includes(host);
-    const title = await page.title().catch(() => '');
+    const url = page.isClosed() ? '' : page.url();
+    const onCommunity = host !== '' && url.includes(host);
+    const title = page.isClosed() ? '' : await page.title().catch(() => '');
     if (onCommunity && /just a moment|verifying|attention required/i.test(title)) {
       if (!announcedCf) {
         log('Cloudflare human-check — solve it in the window, or just wait.', 'warn');
@@ -415,13 +635,22 @@ async function login({ communityUrl, email, password, headed, log, loginMethod }
       if (Date.now() - lastReload > 12000) {
         await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
         lastReload = Date.now();
+        lastNudge = Date.now();
+      }
+    } else if (onCommunity && !/\/(sign_in|users\/sign_in|login)\b/i.test(url)) {
+      // Sitting on a community page with no logged-in marker: the SPA can end up
+      // rendering signed-out chrome after an OAuth round-trip until something
+      // forces a fetch. One reload a minute unsticks that. Never while the
+      // sign-in form is up — that would wipe what's being typed into it.
+      if (Date.now() - lastNudge > 60000) {
+        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        lastNudge = Date.now();
       }
     }
-    await page.waitForTimeout(2000);
+    await sleep(2000);
   }
 
   if (!ok) {
-    await page.close();
     if (stopRequested) throw new Error('Login cancelled.');
     throw new Error(
       headed
@@ -432,7 +661,6 @@ async function login({ communityUrl, email, password, headed, log, loginMethod }
 
   // Cookies are persisted automatically by the on-disk profile — no extra save.
   log('Logged in. Session saved to the browser profile.', 'success');
-  await page.close();
   return true;
 }
 
@@ -440,7 +668,7 @@ async function login({ communityUrl, email, password, headed, log, loginMethod }
 
 // Returns { outcome: 'sent' | 'skipped' | 'failed' | 'aborted', reason }.
 async function sendOne({ profileUrl, message, log, rules }) {
-  const page = await context.newPage();
+  const page = await getPage();
   try {
     await page.goto(profileUrl.trim(), { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(1500);
@@ -524,8 +752,6 @@ async function sendOne({ profileUrl, message, log, rules }) {
   } catch (err) {
     log(`  error: ${err.message}`, 'error');
     return { outcome: 'failed', reason: err.message };
-  } finally {
-    await page.close().catch(() => {});
   }
 }
 
@@ -670,7 +896,7 @@ export async function runCampaign(params, emit) {
 // ─── Member harvesting (shared) ──────────────────────────────────────────────
 
 async function harvestMembers(base, log, { maxScrolls = 200, stableLimit = 3, pageLimit = null } = {}) {
-  const page = await context.newPage();
+  const page = await getPage();
   const found = new Set();
   try {
     log('Opening member directory...');
@@ -679,18 +905,26 @@ async function harvestMembers(base, log, { maxScrolls = 200, stableLimit = 3, pa
 
     const limit = pageLimit ? Math.min(pageLimit, maxScrolls) : maxScrolls;
     let stable = 0;
+    // One locator for the whole run — it re-queries on each use, so there's no
+    // reason to rebuild it (and re-join the selector list) every round.
+    const links = page.locator(selectors.scrape.profileLink.join(', '));
 
     for (let i = 0; i < limit; i++) {
       // Always harvest the members currently on screen FIRST, so a cancel never
       // loses what's already visible.
       const before = found.size;
 
-      const hrefs = await page
-        .locator(selectors.scrape.profileLink.join(', '))
-        .evaluateAll((els) => els.map((e) => e.href));
-      for (const href of hrefs) {
-        if (/\/u\/[^/?#]+/.test(href)) found.add(href.split(/[?#]/)[0]);
-      }
+      // Filter and de-dupe in the page instead of shipping every href across
+      // the CDP boundary — on a big directory this is thousands of strings per
+      // round, and the list only grows.
+      const hrefs = await links.evaluateAll((els) => [
+        ...new Set(
+          els
+            .map((e) => e.href.split(/[?#]/)[0])
+            .filter((h) => /\/u\/[^/?#]+/.test(h))
+        ),
+      ]);
+      for (const href of hrefs) found.add(href);
 
       if (found.size > before) {
         log(`  ${found.size} members found...`);
@@ -707,7 +941,6 @@ async function harvestMembers(base, log, { maxScrolls = 200, stableLimit = 3, pa
 
       // Trigger lazy-loading: bring the last profile into view, nudge the
       // window, and click any "Load more".
-      const links = page.locator(selectors.scrape.profileLink.join(', '));
       const n = await links.count();
       if (n) await links.nth(n - 1).scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
       await page.mouse.wheel(0, 20000);
@@ -717,8 +950,6 @@ async function harvestMembers(base, log, { maxScrolls = 200, stableLimit = 3, pa
     }
   } catch (err) {
     log(`Scrape error: ${err.message}`);
-  } finally {
-    await page.close().catch(() => {});
   }
   return [...found];
 }
@@ -726,15 +957,15 @@ async function harvestMembers(base, log, { maxScrolls = 200, stableLimit = 3, pa
 // ─── Public: log in only (scraping is a separate, button-triggered step) ─────
 
 export async function runLogin(params, emit) {
-  const { communityUrl, email, password, showBrowser, loginMethod } = params;
+  const { communityUrl, email, password, showBrowser } = params;
   const log = (message) => emit({ kind: 'loginLog', message });
   const base = normalizeBase(communityUrl);
   stopRequested = false; // clear any leftover cancel from a previous attempt
 
   try {
-    await login({ communityUrl: base, email, password, headed: showBrowser, log, loginMethod });
+    await login({ communityUrl: base, email, password, headed: showBrowser, log });
   } catch (err) {
-    log(`Login failed: ${err.message}`);
+    log(`Login failed: ${briefError(err)}`);
     emit({ kind: 'loginDone', ok: false });
     return;
   }
@@ -757,7 +988,7 @@ export async function runScrape(params, emit) {
   try {
     await login({ communityUrl: base, email, password, headed: showBrowser, log });
   } catch (err) {
-    log(`Login failed: ${err.message}`);
+    log(`Login failed: ${briefError(err)}`);
     emit({ kind: 'scrapeDone', urls: [] });
     return;
   }

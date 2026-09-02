@@ -118,12 +118,49 @@ export const selectors = {
 
 export const config = {
   port: 3001,
+
+  // ---- Who may call this backend ----
+  // The API can send DMs as you and has no login of its own, so the browser's
+  // same-origin rules are the ONLY thing standing between it and any page you
+  // happen to have open. With CORS wide open, any website you visited could
+  // POST to http://localhost:3001/api/send. So origins are allow-listed.
+  //
+  // Every http://localhost / 127.0.0.1 port is allowed automatically (that
+  // covers `npm run dev` and a locally served build). Add the origin of your
+  // HOSTED frontend here — scheme + host, no trailing slash:
+  // Vercel also gives every deployment its own preview URL; add those here too
+  // (or via the env var) if you want to use one.
+  allowedOrigins: ['https://atlas-aoicom.vercel.app'],
   // Use your real installed browser instead of Playwright's bundled Chromium —
   // this passes Cloudflare's human-check far more often. Options: 'chrome',
   // 'msedge', or '' / null to use the bundled Chromium.
   browserChannel: 'chrome',
   // Where the persistent browser profile + history files are stored.
   sessionDir: '.session',
+
+  // ---- Which Chrome the automation drives ----
+  // ON: attach to a Chrome that is ALREADY OPEN, over the DevTools protocol, and
+  // run in a NEW TAB of it. That window is not Playwright's to own, so it stays
+  // open between runs and survives restarting this backend.
+  //
+  // Chrome only exposes that port when it was started with
+  // `--remote-debugging-port`, and since Chrome 136 it REFUSES to do so for the
+  // DEFAULT user-data-dir — so an everyday Chrome window cannot be attached to
+  // as-is. To drive a Chrome you start yourself, launch it with BOTH flags:
+  //   chrome.exe --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\AtlasChrome"
+  // Atlas attaches to whatever answers on the port. If nothing does, it opens
+  // Chrome that way itself using the profile below — log in once there, and
+  // every later run just adds a tab to that same window.
+  //
+  // OFF: fall back to launching a browser Playwright owns, and closes with it.
+  attachToChrome: true,
+  debugPort: 9222,
+  // Chrome executable. Empty → auto-detect the installed one.
+  chromePath: '',
+  // Profile dir for a Chrome we start ourselves. Empty → the profile inside
+  // sessionDir. Must NOT be Chrome's default user-data dir: Chrome disables
+  // remote debugging there, so the port would never open.
+  chromeUserDataDir: '',
   // Hard floor on per-message delay regardless of UI, to keep things human-ish.
   minDelaySeconds: 2,
   // Per-action timeout (ms) when waiting for a selector.

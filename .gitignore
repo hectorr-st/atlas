@@ -22,8 +22,9 @@ dist-ssr
 *.sw?
 .env
 
-# Saved Circle.so login sessions (cookies) — never commit
-server/.session
+# Saved Circle.so login sessions (cookies) — never commit.
+# Unanchored so a profile created from any working directory is still covered.
+.session/
 
 # Build/distribution archives
 *.zip

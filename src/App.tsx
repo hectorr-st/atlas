@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo, memo } from 'react';
 import { Lock, Send, Square, Search, Bot, X, Trash2, Pause, Play, History, Users, MessageSquare, Link as LinkIcon } from 'lucide-react';
 
 type Status = 'idle' | 'running' | 'paused' | 'done' | 'stopped';
@@ -24,14 +24,27 @@ interface CommunityStat {
   lastRun: string | null;
 }
 
-// Base URL of the local Playwright backend (see /server).
-const API = 'http://localhost:3001';
+// Base URL of the Playwright backend (see /server). The backend always runs on
+// the machine the person is sitting at — even when this UI is served from a
+// static host — so localhost is the right default. VITE_API_URL overrides it at
+// BUILD time for anyone running the backend on a different port or host.
+const API = (import.meta.env.VITE_API_URL || 'http://localhost:3001').replace(/\/+$/, '');
 
 const pct = (part: number, total: number) => (total ? (part / total) * 100 : 0);
 
+// Cap on the rendered log list. A campaign can emit thousands of lines, and
+// every one of them re-renders the whole panel; past a few hundred rows the
+// scroll container is the slowest thing on the page. The authoritative totals
+// live in the stat tiles, not here.
+const MAX_LOGS = 500;
+
+// The three charts are pure functions of their numeric props, but they sit in a
+// component that re-renders on every streamed log line. memo() keeps their SVG
+// path math off that path.
+
 // A progress ring showing how much of the scraped list has been PROCESSED
 // (sent + skipped + failed) out of the total scraped members.
-const ProgressRing = ({ value, total }: { value: number; total: number }) => {
+const ProgressRing = memo(({ value, total }: { value: number; total: number }) => {
   const ratio = total > 0 ? value / total : 0;
   const r = 42;
   const c = 2 * Math.PI * r;
@@ -58,10 +71,10 @@ const ProgressRing = ({ value, total }: { value: number; total: number }) => {
       </div>
     </div>
   );
-};
+});
 
 // A real-time line chart of sending speed (messages per minute over time).
-const SpeedChart = ({ series }: { series: number[] }) => {
+const SpeedChart = memo(({ series }: { series: number[] }) => {
   const w = 260;
   const h = 64;
   const pad = 4;
@@ -93,9 +106,9 @@ const SpeedChart = ({ series }: { series: number[] }) => {
       </svg>
     </div>
   );
-};
+});
 
-const DonutChart = ({ sent, skipped, failed }: { sent: number; skipped: number; failed: number }) => {
+const DonutChart = memo(({ sent, skipped, failed }: { sent: number; skipped: number; failed: number }) => {
   const total = sent + skipped + failed;
   const r = 42;
   const c = 2 * Math.PI * r;
@@ -136,7 +149,7 @@ const DonutChart = ({ sent, skipped, failed }: { sent: number; skipped: number; 
       </div>
     </div>
   );
-};
+});
 
 const getStatusColor = (status: Status) => {
   switch (status) {
@@ -201,7 +214,7 @@ interface ToggleProps {
   onChange: (value: boolean) => void;
 }
 
-const Toggle = ({ label, description, checked, onChange }: ToggleProps) => (
+const Toggle = memo(({ label, description, checked, onChange }: ToggleProps) => (
   <div className="flex items-center justify-between">
     <div className="pr-3">
       <label className="block text-sm text-text">{label}</label>
@@ -223,7 +236,7 @@ const Toggle = ({ label, description, checked, onChange }: ToggleProps) => (
       />
     </button>
   </div>
-);
+));
 
 function App() {
   const [view, setView] = useState<'login' | 'app'>('login');
@@ -237,7 +250,6 @@ function App() {
   const [memberUrls, setMemberUrls] = useState('');
   const [delay, setDelay] = useState(10);
   const [showBrowser, setShowBrowser] = useState(true);
-  const [loginMethod, setLoginMethod] = useState<'google' | 'password'>('google');
   const [skipAlreadySent, setSkipAlreadySent] = useState(true);
   const [skipExistingConversation, setSkipExistingConversation] = useState(true);
   const [skipModerators, setSkipModerators] = useState(true);
@@ -268,9 +280,13 @@ function App() {
     communityUrlRef.current = communityUrl;
   }, [communityUrl]);
 
-  const memberCount = memberUrls
-    .split('\n')
-    .filter((url) => url.trim().length > 0).length;
+  // memberUrls can hold thousands of lines, and this component re-renders on
+  // every streamed log line — so don't re-split the whole list each time.
+  const memberList = useMemo(
+    () => memberUrls.split('\n').map((u) => u.trim()).filter(Boolean),
+    [memberUrls]
+  );
+  const memberCount = memberList.length;
 
   const charCount = message.length;
 
@@ -293,15 +309,10 @@ function App() {
   };
 
   const addLog = (message: string, type: LogType = 'info') => {
-    setLogs((prev) => [
-      ...prev,
-      {
-        id: logIdRef.current++,
-        timestamp: getTimestamp(),
-        message,
-        type,
-      },
-    ]);
+    const entry = { id: logIdRef.current++, timestamp: getTimestamp(), message, type };
+    setLogs((prev) =>
+      prev.length >= MAX_LOGS ? [...prev.slice(prev.length - MAX_LOGS + 1), entry] : [...prev, entry]
+    );
   };
 
   const clearLogs = () => {
@@ -314,14 +325,14 @@ function App() {
   };
 
   const handleLogin = async () => {
-    if (!isLoginValid) return;
+    if (!isLoginValid || isLoggingIn) return;
     setIsLoggingIn(true);
     setLoginLogs(['Connecting to community...']);
     try {
       const res = await fetch(`${API}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ communityUrl, email, password, showBrowser, loginMethod }),
+        body: JSON.stringify({ communityUrl, email, password, showBrowser }),
       });
       if (!res.ok) {
         const { error } = await res.json().catch(() => ({ error: res.statusText }));
@@ -338,7 +349,10 @@ function App() {
   const cancelLogin = async () => {
     setLoginLogs((prev) => [...prev, 'Cancelling...']);
     await fetch(`${API}/api/stop`, { method: 'POST' }).catch(() => {});
-    setIsLoggingIn(false);
+    // Deliberately leave `isLoggingIn` set. The backend needs a few seconds to
+    // unwind the poll loop and always emits `loginDone`, which clears it.
+    // Clearing it here re-enabled the button while the server was still busy,
+    // so the very next click came back 409 "A run is already in progress".
   };
 
   const handleLogout = () => {
@@ -351,10 +365,7 @@ function App() {
   };
 
   const startSending = async () => {
-    const urls = memberUrls
-      .split('\n')
-      .filter((url) => url.trim().length > 0);
-
+    const urls = memberList;
     if (urls.length === 0) return;
 
     setStatus('running');
@@ -555,14 +566,46 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Backstop for the login screen. EventSource reconnects on its own, but every
+  // event emitted while it was down is gone for good — and `loginDone` is the
+  // only thing that clears this screen, so one dropped stream during the 3-minute
+  // manual-login window left the button stuck on "Waiting for login..." forever.
+  // The backend's `busy` flag is the durable truth; two consecutive "not busy"
+  // readings mean the run ended and we missed its event.
+  useEffect(() => {
+    if (!isLoggingIn) return;
+    let idle = 0;
+    const id = setInterval(async () => {
+      try {
+        const { busy } = await (await fetch(`${API}/api/health`)).json();
+        if (busy) {
+          idle = 0;
+          return;
+        }
+        if (++idle < 2) return;
+        setIsLoggingIn(false);
+        setLoginLogs((prev) => [
+          ...prev,
+          'Lost contact with the run before it reported back — try again.',
+        ]);
+      } catch {
+        /* backend unreachable — keep waiting; handleLogin already reports that */
+      }
+    }, 4000);
+    return () => clearInterval(id);
+  }, [isLoggingIn]);
+
   // Real-time sending-speed sampler: every 2s while active, count messages sent
   // in the trailing 60s and append to the speed series.
   useEffect(() => {
     if (!isActive) return;
     const id = setInterval(() => {
       const now = Date.now();
-      const perMin = sentTimesRef.current.filter((t) => now - t <= 60000).length;
-      setSpeedSeries((prev) => [...prev.slice(-39), perMin]);
+      // Drop timestamps that have aged out instead of re-filtering an array
+      // that grows with every message sent for the life of the campaign.
+      const recent = sentTimesRef.current.filter((t) => now - t <= 60000);
+      sentTimesRef.current = recent;
+      setSpeedSeries((prev) => [...prev.slice(-39), recent.length]);
     }, 2000);
     return () => clearInterval(id);
   }, [isActive]);
@@ -606,33 +649,9 @@ function App() {
               />
             </div>
 
-            {/* Login method selector */}
-            <div>
-              <label className="block text-sm text-text mb-1.5">Sign-in method</label>
-              <div className="grid grid-cols-2 gap-2 bg-surface-2 p-1 rounded-[8px]">
-                {(['google', 'password'] as const).map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => setLoginMethod(m)}
-                    disabled={isLoggingIn}
-                    className={`text-sm py-2 rounded-[6px] transition-colors ${
-                      loginMethod === m
-                        ? 'bg-accent text-white'
-                        : 'text-muted hover:text-text'
-                    }`}
-                  >
-                    {m === 'google' ? 'Sign in with Google' : 'Email & password'}
-                  </button>
-                ))}
-              </div>
-            </div>
-
             <div>
               <label className="block text-sm text-text mb-1">
-                Email{' '}
-                <span className="text-muted font-normal">
-                  {loginMethod === 'google' ? '(your Google email)' : '(optional)'}
-                </span>
+                Email <span className="text-muted font-normal">(optional)</span>
               </label>
               <input
                 type="email"
@@ -643,22 +662,20 @@ function App() {
                 disabled={isLoggingIn}
               />
             </div>
-            {loginMethod === 'password' && (
-              <div>
-                <label className="block text-sm text-text mb-1">
-                  Password <span className="text-muted font-normal">(optional)</span>
-                </label>
-                <input
-                  type="password"
-                  className="input-field"
-                  placeholder="••••••••"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  disabled={isLoggingIn}
-                  onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
-                />
-              </div>
-            )}
+            <div>
+              <label className="block text-sm text-text mb-1">
+                Password <span className="text-muted font-normal">(optional)</span>
+              </label>
+              <input
+                type="password"
+                className="input-field"
+                placeholder="••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={isLoggingIn}
+                onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
+              />
+            </div>
 
             <Toggle
               label="Show browser window"

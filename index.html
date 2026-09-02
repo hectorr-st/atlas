@@ -7,7 +7,26 @@
     <title>Atlas</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <!--
+      Load the webfonts ASYNCHRONOUSLY. As a plain <link rel="stylesheet"> this
+      is render-blocking AND script-blocking: on a slow or offline machine the
+      whole app stayed blank until the request to fonts.googleapis.com resolved,
+      which is a poor trade for a tool that otherwise runs entirely locally.
+      Swapping rel to "stylesheet" on load keeps the fonts; the Tailwind stacks
+      already fall back to system-ui / monospace until they arrive.
+    -->
+    <link
+      rel="preload"
+      as="style"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      onload="this.onload=null;this.rel='stylesheet'"
+    />
+    <noscript>
+      <link
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      />
+    </noscript>
   </head>
   <body>
     <div id="root"></div>

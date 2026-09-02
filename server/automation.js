@@ -65,7 +65,13 @@ export function setDelay(seconds) {
 // burned 24s per isLoggedIn() call — inside a 2s polling loop.
 async function findFirst(scope, candidates, { timeout = 1500 } = {}) {
   const attempts = candidates.map((sel) => {
-    const loc = scope.locator(sel).first();
+    // filter({visible}) BEFORE first(). Plain .first() takes the first match in
+    // DOM ORDER and then waits for that one element to appear — so a hidden
+    // duplicate ahead of the real control (a responsive variant, a collapsed
+    // menu, an unrendered template) made the whole lookup time out with a
+    // perfectly visible button sitting on the page. That is what reported
+    // "no message button" for members who plainly had one.
+    const loc = scope.locator(sel).filter({ visible: true }).first();
     return loc.waitFor({ state: 'visible', timeout }).then(
       () => loc,
       () => null
@@ -674,8 +680,30 @@ async function sendOne({ profileUrl, message, log, rules }) {
     await page.waitForTimeout(1500);
 
     // The "Message" button lives on the /u/ profile. No button → can't DM them.
-    const msgBtn = await findFirst(page, selectors.message.messageButton);
+    // This one gate decides whether the member is contacted at all, so it gets a
+    // full action timeout rather than the 1.5s default — a profile that renders
+    // its actions after an extra fetch is not a member without a Message button.
+    const msgBtn = await findFirst(page, selectors.message.messageButton, {
+      timeout: config.actionTimeoutMs,
+    });
     if (!msgBtn) {
+      // Skipping everyone is the failure mode of a stale selector, and "no
+      // message button" alone gives nothing to fix it with. List what WAS
+      // clickable so a label change is obvious from the log.
+      const labels = await page
+        .locator('button, a')
+        .filter({ visible: true })
+        .evaluateAll((els) =>
+          [
+            ...new Set(
+              els
+                .map((e) => (e.innerText || e.getAttribute('aria-label') || '').trim())
+                .filter(Boolean)
+            ),
+          ].slice(0, 20)
+        )
+        .catch(() => []);
+      log(`  no Message button. Visible controls: ${labels.join(' | ') || '(none)'}`, 'warn');
       return { outcome: 'skipped', reason: 'no message button' };
     }
     await msgBtn.click();

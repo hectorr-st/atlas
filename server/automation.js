@@ -32,6 +32,9 @@ let contextMode = null;
 // and steals focus on every iteration; reusing one tab keeps the whole run in
 // place where you can actually watch it. Reset whenever the context goes away.
 let sharedPage = null;
+// Additional tabs opened for a concurrent campaign. Transient: created when a
+// run starts, closed when it ends.
+let workerPages = [];
 
 // A run is cancellable via this flag, flipped by stop().
 let stopRequested = false;
@@ -148,6 +151,19 @@ function saveHistory(file, set) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Wait for a condition instead of sleeping a fixed amount. The fast path costs
+// one tick rather than the worst case, which is where most of the per-message
+// time was going: four blind waits that every message paid in full whether the
+// page was ready in 50ms or not.
+async function waitUntil(check, { timeout = 3000, interval = 100 } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (await check().catch(() => false)) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(interval);
+  }
+}
 
 // ─── Campaign history (per community), persisted across runs ─────────────────
 
@@ -312,6 +328,13 @@ async function startDebugChrome(log) {
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-blink-features=AutomationControlled',
+      // A campaign runs several tabs at once and all but one of them are in the
+      // background, where Chrome throttles timers and deprioritises rendering —
+      // which showed up as more tabs being SLOWER than fewer. Playwright passes
+      // these to browsers it launches itself; a Chrome we start needs them too.
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
     ],
     { detached: true, stdio: 'ignore' }
   ).unref();
@@ -415,6 +438,7 @@ async function ensureContext({ headed, log }) {
   context = mode === 'attached' ? await attachContext(log) : await launchContext(wantHeaded, log);
   contextMode = mode;
   context.setDefaultTimeout(config.actionTimeoutMs);
+  context.setDefaultNavigationTimeout(config.navigationTimeoutMs);
   // Hide the navigator.webdriver flag that automated Chromium exposes.
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -436,14 +460,38 @@ async function getPage(ctx = context) {
       : ctx.pages().find((p) => !p.isClosed() && p.url() === 'about:blank');
   sharedPage = blank || (await ctx.newPage());
   await sharedPage.bringToFront().catch(() => {});
-  // Nothing closes the tab between steps any more, and page.close() skipped
-  // beforeunload handlers while a navigation does not — so a composer left
-  // holding text can now raise "Leave site?" and block the next member forever.
-  // Accept those; keep Playwright's default (dismiss) for anything else.
-  sharedPage.on('dialog', (d) => {
+  attachDialogHandler(sharedPage);
+  return sharedPage;
+}
+
+// Nothing closes these tabs between members any more, and page.close() skipped
+// beforeunload handlers while a navigation does not — so a composer left holding
+// text can raise "Leave site?" and block that tab forever. Accept those; keep
+// Playwright's default (dismiss) for anything else.
+function attachDialogHandler(page) {
+  page.on('dialog', (d) => {
     (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {});
   });
-  return sharedPage;
+}
+
+// Extra tabs for a campaign that works several members at once. Worker 0 is the
+// shared tab; the others exist only for the run and are closed with it, so a
+// finished campaign does not leave a pile of tabs in the window.
+async function getWorkerPages(count, ctx = context) {
+  const pages = [await getPage(ctx)];
+  while (pages.length < count) {
+    const page = await ctx.newPage();
+    attachDialogHandler(page);
+    workerPages.push(page);
+    pages.push(page);
+  }
+  return pages;
+}
+
+async function closeWorkerPages() {
+  const extra = workerPages;
+  workerPages = [];
+  await Promise.all(extra.map((p) => p.close().catch(() => {})));
 }
 
 export async function shutdown() {
@@ -462,6 +510,7 @@ export async function shutdown() {
   context = null;
   contextMode = null;
   sharedPage = null;
+  workerPages = [];
 }
 
 // ─── Login ───────────────────────────────────────────────────────────────────
@@ -673,16 +722,28 @@ async function login({ communityUrl, email, password, headed, log }) {
 // ─── Send one message ────────────────────────────────────────────────────────
 
 // Returns { outcome: 'sent' | 'skipped' | 'failed' | 'aborted', reason }.
-async function sendOne({ profileUrl, message, log, rules }) {
-  const page = await getPage();
+// The tab is passed in: a campaign runs several of these at once, each on its
+// own page.
+async function sendOne({ page, profileUrl, message, log, rules, readyTimeout = 4000 }) {
   try {
-    await page.goto(profileUrl.trim(), { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1500);
+    // 'commit' resolves as soon as the response arrives, not once the whole
+    // document has parsed. Everything below waits for the elements it needs
+    // anyway, so waiting for the document first only adds a second place the
+    // member can be lost — and with several tabs loading at once, that is
+    // exactly where they were being lost.
+    const open = () => page.goto(profileUrl.trim(), { waitUntil: 'commit' });
+    try {
+      await open();
+    } catch (err) {
+      // A slow profile is not a member without a Message button. One retry
+      // costs a few seconds; giving up costs the member.
+      log(`  slow profile, retrying — ${briefError(err)}`, 'warn');
+      await open();
+    }
 
-    // The "Message" button lives on the /u/ profile. No button → can't DM them.
-    // This one gate decides whether the member is contacted at all, so it gets a
-    // full action timeout rather than the 1.5s default — a profile that renders
-    // its actions after an extra fetch is not a member without a Message button.
+    // No blind settle before this. findFirst already waits for the button to
+    // become visible, so a fixed sleep in front of it is pure addition: dead
+    // time on a fast profile, and no help at all on a slow one.
     const msgBtn = await findFirst(page, selectors.message.messageButton, {
       timeout: config.actionTimeoutMs,
     });
@@ -712,21 +773,39 @@ async function sendOne({ profileUrl, message, log, rules }) {
     await page.waitForURL(/\/messages\//, { timeout: 15000 }).catch(() => {});
     const composer = await findFirst(page, selectors.message.composer, { timeout: 12000 });
     if (!composer) throw new Error('message composer not found');
-    await page.waitForTimeout(1200); // let the conversation panel settle
-
-    // Staff member? The role badge (e.g. ADMIN) is in the profile panel here.
-    if (rules.skipModerators) {
-      const role = await findFirst(page, selectors.message.moderatorMarkers, { timeout: 1500 });
-      if (role) return { outcome: 'skipped', reason: 'staff/moderator' };
-    }
 
     // Already messaged? A brand-new conversation shows "the beginning of your
-    // direct message history". If that marker is ABSENT, there's prior history.
+    // direct message history". Its PRESENCE = safe to send; its ABSENCE = there
+    // is prior history.
+    //
+    // This runs FIRST, and with room to spare, because its positive case is the
+    // common one: for anybody we are about to message the marker is there, so it
+    // returns the moment the thread paints instead of charging a fixed settle.
+    // Finding it also proves the panel has rendered, which the badge check below
+    // then relies on.
+    //
+    // The budget matters more than it looks. This is a decision made from an
+    // ABSENCE, so a thread that simply has not painted yet is indistinguishable
+    // from one with history — and giving up early silently skips a member who
+    // has never been contacted. Tabs compete for the CPU, so the caller scales this
+    // with how many of them are running.
+    let panelReady = false;
     if (rules.skipExistingConversation) {
       const isNew = await findFirst(page, selectors.message.newConversationMarker, {
-        timeout: 2500,
+        timeout: readyTimeout,
       });
       if (!isNew) return { outcome: 'skipped', reason: 'already messaged' };
+      panelReady = true;
+    }
+
+    // Staff member? The role badge (e.g. ADMIN) is in the profile panel here.
+    // A miss costs the entire timeout and almost nobody is staff, so once the
+    // panel is known to be up this only needs long enough to query the DOM.
+    if (rules.skipModerators) {
+      const role = await findFirst(page, selectors.message.moderatorMarkers, {
+        timeout: panelReady ? 500 : 1500,
+      });
+      if (role) return { outcome: 'skipped', reason: 'staff/moderator' };
     }
 
     // Bail before sending if the user hit Stop while we were navigating.
@@ -740,19 +819,21 @@ async function sendOne({ profileUrl, message, log, rules }) {
     //     message into several messages. So we insert each line separately and
     //     use Shift+Enter for the line breaks, keeping it ONE message.
     await composer.click();
-    const lines = String(message).split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      if (i > 0) await page.keyboard.press('Shift+Enter');
-      if (lines[i]) await page.keyboard.insertText(lines[i]);
-    }
-    await page.waitForTimeout(400);
-    const typed = (await composer.innerText().catch(() => '')).trim();
-    if (!typed) {
+    const typeWith = async (write) => {
+      const lines = String(message).split('\n');
       for (let i = 0; i < lines.length; i++) {
         if (i > 0) await page.keyboard.press('Shift+Enter');
-        if (lines[i]) await composer.pressSequentially(lines[i], { delay: 8 });
+        if (lines[i]) await write(lines[i]);
       }
-      await page.waitForTimeout(400);
+    };
+    await typeWith((line) => page.keyboard.insertText(line));
+
+    // Wait for the text to land instead of sleeping a flat 400ms for it — it is
+    // normally there within a tick or two.
+    const hasText = () => composer.innerText().then((t) => t.trim().length > 0);
+    if (!(await waitUntil(hasText, { timeout: 1500 }))) {
+      await typeWith((line) => composer.pressSequentially(line, { delay: 8 }));
+      await waitUntil(hasText, { timeout: 1500 });
     }
 
     if (selectors.message.sendWithEnter) {
@@ -771,15 +852,22 @@ async function sendOne({ profileUrl, message, log, rules }) {
     }
 
     // Confirm the send actually happened: the composer clears once it posts.
-    await page.waitForTimeout(1200);
-    const leftover = (await composer.innerText().catch(() => '')).trim();
-    if (leftover && leftover === message.trim()) {
-      return { outcome: 'failed', reason: 'message did not send (still in box)' };
-    }
+    // Polling returns the moment it does, where a fixed wait charged every
+    // single message for the worst case. A composer that has gone away counts as
+    // sent — the thread re-rendering under us is a success, not a failure.
+    const cleared = await waitUntil(
+      () =>
+        composer.innerText().then(
+          (t) => t.trim() !== String(message).trim(),
+          () => true
+        ),
+      { timeout: 4000 }
+    );
+    if (!cleared) return { outcome: 'failed', reason: 'message did not send (still in box)' };
     return { outcome: 'sent', reason: '' };
   } catch (err) {
-    log(`  error: ${err.message}`, 'error');
-    return { outcome: 'failed', reason: err.message };
+    log(`  error: ${briefError(err)}`, 'error');
+    return { outcome: 'failed', reason: briefError(err) };
   }
 }
 
@@ -816,6 +904,7 @@ export async function runCampaign(params, emit) {
   let sent = 0;
   let skipped = 0;
   let failed = 0;
+  let processed = 0;
 
   try {
     await login({ communityUrl, email, password, headed: showBrowser, log });
@@ -829,8 +918,30 @@ export async function runCampaign(params, emit) {
   const historyFile = historyFileFor(normalizeBase(communityUrl), email);
   const history = loadHistory(historyFile);
 
-  log(`Starting message sending to ${urls.length} members...`, 'info');
+  // How many members are handled at once, each on its own tab. Capped so a
+  // typo in the UI cannot open fifty tabs against the community at once.
+  const workerCount = Math.max(
+    1,
+    Math.min(
+      Number(params.concurrency) || config.sendConcurrency || 1,
+      config.maxConcurrency,
+      urls.length
+    )
+  );
+
+  log(
+    `Starting message sending to ${urls.length} members` +
+      (workerCount > 1 ? ` (${workerCount} at a time)` : '') +
+      '...',
+    'info'
+  );
   emit({ kind: 'progress', index: 0, total: urls.length });
+
+  // How long a thread gets to paint before an absent "new conversation" marker
+  // is believed. Tabs share one browser, so each extra worker slows every page:
+  // measured, 3 tabs was enough to push a fresh thread past a flat 4s and get a
+  // never-contacted member skipped as already messaged.
+  const readyTimeout = Math.min(15000, 4000 + 2500 * (workerCount - 1));
 
   // Record the run to history and emit the terminal status.
   const finalize = (st) => {
@@ -848,73 +959,108 @@ export async function runCampaign(params, emit) {
     emit({ kind: 'historyUpdated' });
   };
 
-  for (let i = 0; i < urls.length; i++) {
-    if (stopRequested) {
-      log('Sending stopped by user.', 'warn');
-      finalize('stopped');
-      return;
-    }
+  // Workers pull from this shared cursor rather than taking a fixed slice, so
+  // one member stuck behind a slow profile never holds up the others.
+  let cursor = 0;
+  let pauseAnnounced = false;
 
-    // Pause support: hold here while paused, without ending the run.
-    if (paused) {
-      log('Paused.', 'warn');
-      emit({ kind: 'status', status: 'paused' });
-      while (paused && !stopRequested) await sleep(500);
-      if (stopRequested) {
-        log('Sending stopped by user.', 'warn');
-        finalize('stopped');
-        return;
+  const worker = async (page) => {
+    for (;;) {
+      if (stopRequested) return;
+
+      // Pause support: hold here while paused, without ending the run. Only the
+      // first worker to notice says so — one "Paused." line, not one per tab.
+      if (paused) {
+        if (!pauseAnnounced) {
+          pauseAnnounced = true;
+          log('Paused.', 'warn');
+          emit({ kind: 'status', status: 'paused' });
+        }
+        while (paused && !stopRequested) await sleep(300);
+        if (pauseAnnounced) {
+          pauseAnnounced = false;
+          log('Resumed.', 'info');
+          emit({ kind: 'status', status: 'running' });
+        }
       }
-      log('Resumed.', 'info');
-      emit({ kind: 'status', status: 'running' });
-    }
+      if (stopRequested) return;
 
-    const url = urls[i];
-    const username = url.split('/u/')[1] || url;
-    const canonical = normalizeProfileUrl(url);
-    emit({ kind: 'progress', index: i + 1, total: urls.length });
+      const i = cursor++;
+      if (i >= urls.length) return;
 
-    // Skip without opening the browser if we've messaged them in a past run.
-    if (rules.skipAlreadySent && history.has(canonical)) {
-      skipped++;
-      log(`Skipped /u/${username} — already messaged (history)`, 'warn');
-      emit({ kind: 'stats', sent, skipped, failed });
-      continue;
-    }
+      const url = urls[i];
+      const username = url.split('/u/')[1] || url;
+      const canonical = normalizeProfileUrl(url);
 
-    const { outcome, reason } = await sendOne({ profileUrl: url, message, log, rules });
-    if (outcome === 'aborted') {
-      // Stop was pressed mid-member: don't count it, loop top will finalize.
-      continue;
-    } else if (outcome === 'sent') {
-      sent++;
-      history.add(canonical);
-      saveHistory(historyFile, history);
-      log(`Message sent to /u/${username}`, 'success');
-    } else if (outcome === 'skipped') {
-      skipped++;
-      if (reason === 'already messaged') {
+      // Skip without opening the browser if we've messaged them in a past run.
+      if (rules.skipAlreadySent && history.has(canonical)) {
+        skipped++;
+        processed++;
+        log(`Skipped /u/${username} — already messaged (history)`, 'warn');
+        emit({ kind: 'progress', index: processed, total: urls.length });
+        emit({ kind: 'stats', sent, skipped, failed });
+        continue;
+      }
+
+      const startedAt = Date.now();
+      const { outcome, reason } = await sendOne({
+        page,
+        profileUrl: url,
+        message,
+        log,
+        rules,
+        readyTimeout,
+      });
+
+      if (outcome === 'aborted') continue; // Stop mid-member: don't count it.
+      processed++;
+      if (outcome === 'sent') {
+        sent++;
         history.add(canonical);
         saveHistory(historyFile, history);
+        log(`Message sent to /u/${username}`, 'success');
+      } else if (outcome === 'skipped') {
+        skipped++;
+        // Deliberately NOT written to history. "Already messaged" is inferred
+        // from a marker that is missing, and under load a thread that has not
+        // finished painting looks exactly the same — caching that guess would
+        // permanently exclude someone who was never actually contacted. Only a
+        // confirmed send earns a history entry; re-checking next run costs one
+        // page visit and reaches the same answer when it is genuinely true.
+        log(`Skipped /u/${username} — ${reason}`, 'warn');
+      } else {
+        failed++;
+        log(`Failed /u/${username}`, 'error');
       }
-      log(`Skipped /u/${username} — ${reason}`, 'warn');
-    } else {
-      failed++;
-      log(`Failed /u/${username}`, 'error');
-    }
-    emit({ kind: 'stats', sent, skipped, failed });
+      emit({ kind: 'progress', index: processed, total: urls.length });
+      emit({ kind: 'stats', sent, skipped, failed });
 
-    // Delay between members. The target is recomputed every tick from the LIVE
-    // delay value, so changing it in the UI (e.g. while paused) takes effect
-    // immediately. Also reacts to Stop within ~200ms.
-    if (i < urls.length - 1) {
-      const sentAt = Date.now();
+      // Pace this worker before it takes another member. The target is re-read
+      // every tick from the LIVE value, so changing it in the UI (even while
+      // paused) applies immediately, and Stop is noticed within ~200ms.
+      //
+      // Measured from the START of the member, not the end: the delay is how
+      // often a worker begins a message, so time already spent sending counts
+      // towards it instead of being added on top.
       while (!stopRequested) {
         const waitMs = Math.max(config.minDelaySeconds, currentDelaySeconds) * 1000;
-        if (Date.now() - sentAt >= waitMs) break;
+        if (Date.now() - startedAt >= waitMs) break;
         await sleep(200);
       }
     }
+  };
+
+  try {
+    const pages = await getWorkerPages(workerCount);
+    await Promise.all(pages.map((page) => worker(page)));
+  } finally {
+    await closeWorkerPages();
+  }
+
+  if (stopRequested) {
+    log('Sending stopped by user.', 'warn');
+    finalize('stopped');
+    return;
   }
 
   log(`Done! Sent: ${sent}, Skipped: ${skipped}, Failed: ${failed}`, 'success');

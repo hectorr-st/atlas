@@ -161,10 +161,28 @@ export const config = {
   // sessionDir. Must NOT be Chrome's default user-data dir: Chrome disables
   // remote debugging there, so the port would never open.
   chromeUserDataDir: '',
-  // Hard floor on per-message delay regardless of UI, to keep things human-ish.
-  minDelaySeconds: 2,
+  // Hard floor on per-message delay regardless of UI. Zero lets the UI ask for
+  // no pacing at all; raise it to stop any run going faster than you intend.
+  // Note a floor of N seconds caps ONE worker at 60/N messages a minute.
+  minDelaySeconds: 0,
+
+  // ---- Throughput ----
+  // How many members a campaign works on at once, each on its own tab. The UI
+  // can override it per run. Sequential sending tops out around 10-15/min
+  // because every member costs two page loads; concurrency is what goes past
+  // that. It also multiplies the load you put on the community, and a high rate
+  // of identical DMs from one account is what spam heuristics look for.
+  sendConcurrency: 3,
+  // Ceiling on the above, so a typo in the UI cannot open fifty tabs at once.
+  maxConcurrency: 8,
   // Per-action timeout (ms) when waiting for a selector.
   actionTimeoutMs: 15000,
+  // Navigation gets its own, much larger budget. A selector either resolves
+  // quickly or is not there, but a page load is at the mercy of the network,
+  // the community's own speed, and every other tab loading at the same time —
+  // sharing the action timeout meant a merely slow profile was recorded as a
+  // failed member.
+  navigationTimeoutMs: 45000,
 
   // ---- Skip rules (UI toggles override these per run) ----
   skipAlreadySent: true,

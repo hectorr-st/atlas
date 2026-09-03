@@ -248,7 +248,8 @@ function App() {
   const [password, setPassword] = useState('');
   const [message, setMessage] = useState('');
   const [memberUrls, setMemberUrls] = useState('');
-  const [delay, setDelay] = useState(10);
+  const [delay, setDelay] = useState(0);
+  const [concurrency, setConcurrency] = useState(3);
   const [showBrowser, setShowBrowser] = useState(true);
   const [skipAlreadySent, setSkipAlreadySent] = useState(true);
   const [skipExistingConversation, setSkipExistingConversation] = useState(true);
@@ -391,6 +392,7 @@ function App() {
           message,
           memberUrls,
           delay,
+          concurrency,
           showBrowser,
           skipAlreadySent,
           skipExistingConversation,
@@ -836,14 +838,38 @@ function App() {
                     <input
                       type="number"
                       className="input-field w-20 text-center"
-                      min={2}
+                      min={0}
                       max={60}
                       value={delay}
-                      onChange={(e) => setDelay(Math.max(2, Math.min(60, parseInt(e.target.value) || 2)))}
+                      onChange={(e) => setDelay(Math.max(0, Math.min(60, parseInt(e.target.value) || 0)))}
                     />
                     <span className="text-sm text-muted">seconds</span>
                   </div>
-                  <p className="text-xs text-muted mt-1">Lower = faster but higher detection risk</p>
+                  <p className="text-xs text-muted mt-1">
+                    How often each tab starts a message. 0 = as fast as the pages load.
+                  </p>
+                </div>
+
+                {/* Parallel tabs */}
+                <div>
+                  <label className="block text-sm text-text mb-1">Members at a time</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      className="input-field w-20 text-center"
+                      min={1}
+                      max={8}
+                      value={concurrency}
+                      onChange={(e) =>
+                        setConcurrency(Math.max(1, Math.min(8, parseInt(e.target.value) || 1)))
+                      }
+                    />
+                    <span className="text-sm text-muted">tabs</span>
+                  </div>
+                  <p className="text-xs text-muted mt-1">
+                    Each tab works a different member. More = faster, and more load on the
+                    community at once.
+                  </p>
                 </div>
 
                 {/* Show browser */}
